@@ -342,6 +342,115 @@ describe('document: hooks:', function () {
       assert.equal(false, presave);
       done();
     });
+  });
+
+  it('post remove hooks on subdocuments work', function(done) {
+    var db = start();
+    var sub = Schema({ _id: Number });
+    var called = { pre: 0, post: 0 };
+
+    sub.pre('remove', function (next) {
+      called.pre++;
+      next();
+    });
+
+    sub.post('remove', function (doc) {
+      called.post++;
+      assert.ok(doc instanceof Document);
+    });
+
+    var par = Schema({ sub: [sub], name: String });
+    var M = db.model('post-remove-hooks-sub', par);
+
+    var m = new M({ sub: [{ _id: 1 }, { _id: 2 }] });
+    m.save(function (err) {
+      assert.ifError(err);
+      assert.equal(0, called.pre);
+      assert.equal(0, called.post);
+
+      M.findById(m, function(err, doc) {
+        assert.ifError(err);
+
+        doc.sub.id(1).remove();
+        doc.save(function (err) {
+          assert.ifError(err);
+          assert.equal(1, called.pre);
+          assert.equal(1, called.post);
+
+          // does not get called when not removed
+          doc.name = 'changed1';
+          doc.save(function (err) {
+            assert.ifError(err);
+            assert.equal(1, called.pre);
+            assert.equal(1, called.post);
+
+            doc.sub.id(2).remove();
+            doc.remove(function (err) {
+              assert.ifError(err);
+              assert.equal(2, called.pre);
+              assert.equal(2, called.post);
+
+              // does not get called twice
+              doc.remove(function (err) {
+                assert.ifError(err);
+                assert.equal(2, called.pre);
+                assert.equal(2, called.post);
+                done();
+              });
+            });
+          });
+        });
+      });
+    });
+  })
+
+  it("pre save hooks should run in parallel", function (done) {
+    // we set the time out to be double that of the validator - 1 (so that running in serial will be greater then that)
+    this.timeout(1000);
+    var db = start(),
+      count = 0
+
+    var SchemaWithPreSaveHook = new Schema ({
+      preference: String
+    });
+    SchemaWithPreSaveHook.pre('save', true, function hook (next, done) {
+      setTimeout(function () {
+        count++;
+        next();
+        if (count == 3) {
+          done(new Error("gaga"));
+        } else {
+          done();
+        }
+      }, 500);
+    });
+
+    var MWPSH = db.model('mwpsh', new Schema({subs: [SchemaWithPreSaveHook]}));
+    var m = new MWPSH({
+      subs: [
+        {
+          preference: "xx"
+        }
+        ,
+        {
+          preference: "yy"
+        }
+        ,
+        {
+          preference: "1"
+        }
+        ,
+        {
+          preference: "2"
+        }
+      ]
+    });
+
+    m.save(function (err) {
+      assert.equal(err.message, "gaga");
+      assert.equal(count, 4);
+      done();
+    });
   })
 
 });

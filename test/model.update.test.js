@@ -170,7 +170,7 @@ describe('model: update:', function(){
 
           BlogPost.update({ _id: post._id }, update2, function (err) {
             assert.ok(err);
-            assert.ok(/^can't append to array/.test(err.message));
+            assert.ok(err.message.length > 0);
             BlogPost.findById(post, function (err, p) {
               assert.ifError(err);
 
@@ -180,7 +180,8 @@ describe('model: update:', function(){
 
               BlogPost.update({ _id: post._id }, update3, function (err) {
                 assert.ok(err);
-                assert.ok(/Invalid atomic update value/.test(err.message));
+
+                assert.ok(/Invalid atomic update value for \$pull\. Expected an object, received string/.test(err.message));
 
                 var update4 = {
                     $inc: { idontexist: 1 }
@@ -638,7 +639,7 @@ describe('model: update:', function(){
 
   it('updates a number to null (gh-640)', function(done){
     var db = start()
-    var B = db.model('BlogPostB')
+    var B = db.model('BlogPostForUpdates', 'wwwwowowo'+random());
     var b = new B({ meta: { visitors: null }});
     b.save(function (err) {
       assert.ifError(err);
@@ -733,6 +734,53 @@ describe('model: update:', function(){
     })
   })
 
+  it('handles positional operators with referenced docs (gh-1572)', function(done){
+    var db = start();
+
+    var so = new Schema({ title : String, obj : [String] });
+    var Some = db.model('Some' + random(), so);
+
+    Some.create({ obj: ['a','b','c'] }, function (err, s) {
+      assert.ifError(err);
+
+      Some.update({ _id: s._id, obj: 'b' }, { $set: { "obj.$" : 2 }}, function(err) {
+        assert.ifError(err);
+
+        Some.findById(s._id, function (err, ss) {
+          assert.ifError(err);
+
+          assert.strictEqual(ss.obj[1], '2');
+          done();
+        });
+      });
+    });
+  })
+
+  it('use .where for update condition (gh-2170)', function(done){
+    var db = start();
+    var so = new Schema({ num : Number });
+    var Some = db.model('gh-2170' + random(), so);
+
+    Some.create([ {num: 1}, {num: 1} ], function(err, doc0, doc1){
+      assert.ifError(err);
+      var sId0 = doc0._id;
+      var sId1 = doc1._id;
+      Some.where({_id: sId0}).update({}, {$set: {num: '99'}}, {multi: true}, function(err, cnt){
+        assert.ifError(err);
+        assert.equal(1, cnt);
+        Some.findById(sId0, function(err, doc0_1){
+          assert.ifError(err);
+          assert.equal(99, doc0_1.num);
+          Some.findById(sId1, function(err, doc1_1){
+            assert.ifError(err);
+            assert.equal(1, doc1_1.num);
+            done();
+          });
+        });
+      });
+    });
+  })
+
   describe('mongodb 2.4 features', function(){
     var mongo24_or_greater = false;
 
@@ -811,5 +859,163 @@ describe('model: update:', function(){
     })
   })
 
+  describe('mongodb 2.6 features', function() {
+    var mongo26_or_greater = false;
 
+    before(function(done) {
+      start.mongodVersion(function (err, version) {
+        assert.ifError(err);
+        mongo26_or_greater = 2 < version[0] || (2 == version[0] && 6 <= version[1]);
+        done();
+      });
+    });
+
+    it('supports $position', function(done) {
+      if (!mongo26_or_greater) {
+        return done();
+      }
+
+      var db = start();
+      var schema = Schema({ name: String, n: [{ x: Number }] });
+      var M = db.model('setoninsert-' + random(), schema);
+
+      var m = new M({ name: '2.6', n: [{ x : 0 }] });
+      m.save(function(error, m) {
+        assert.ifError(error);
+        assert.equal(1, m.n.length);
+        M.update(
+           { name: '2.6' },
+           { $push: { n: { $each: [{x: 2}, {x: 1}], $position: 0 } } },
+           function(error) {
+             assert.ifError(error);
+             M.findOne({ name: '2.6' }, function(error, m) {
+               assert.ifError(error);
+               assert.equal(3, m.n.length);
+               assert.equal(2, m.n[0].x);
+               assert.equal(1, m.n[1].x);
+               assert.equal(0, m.n[2].x);
+               done();
+             });
+           });
+      });
+    });
+
+    it('supports $currentDate', function(done) {
+      if (!mongo26_or_greater) {
+        return done();
+      }
+
+      var db = start();
+      var schema = Schema({ name: String, lastModified: Date, lastModifiedTS: Date });
+      var M = db.model('gh-2019', schema);
+
+      var m = new M({ name: '2.6' });
+      m.save(function(error, m) {
+        assert.ifError(error);
+        var before = Date.now();
+        M.update(
+           { name: '2.6' },
+           { $currentDate: { lastModified: true, lastModifiedTS: { $type: 'timestamp' } } },
+           function(error) {
+             assert.ifError(error);
+             M.findOne({ name: '2.6' }, function(error, m) {
+               var after = Date.now();
+               assert.ifError(error);
+               assert.ok(m.lastModified.getTime() >= before);
+               assert.ok(m.lastModified.getTime() <= after);
+               done();
+             });
+           });
+      });
+    });
+  });
+
+  describe('{overwrite : true}', function () {
+    it('overwrite works', function(done){
+      var db = start()
+      var schema = new Schema({ mixed: {} });
+      var M = db.model('updatesmixed-' + random(), schema);
+
+      M.create({ mixed: 'something' }, function (err, created) {
+        assert.ifError(err);
+
+        M.update({ _id: created._id }, { mixed: {} }, { overwrite : true }, function (err) {
+          assert.ifError(err);
+          M.findById(created._id, function (err, doc) {
+            assert.ifError(err);
+            assert.equal(created.id, doc.id)
+            assert.equal(typeof doc.mixed, 'object');
+            assert.equal(Object.keys(doc.mixed).length, 0);
+            done()
+          })
+        })
+      })
+    })
+
+    it('overwrites all properties', function(done){
+      var db = start();
+      var sch = new Schema({ title : String, subdoc : { name : String, num : Number }});
+
+      var M = db.model('updateover'+random(), sch);
+
+      M.create({ subdoc : { name : 'that', num : 1 } }, function (err, doc) {
+        assert.ifError(err);
+
+        M.update({ _id : doc.id }, { title : 'something!' }, { overwrite : true }, function (err) {
+          assert.ifError(err);
+          M.findById(doc.id, function (err, doc) {
+            assert.ifError(err);
+            assert.equal(doc.title, 'something!');
+            assert.equal(doc.subdoc.name, undefined);
+            assert.equal(doc.subdoc.num, undefined);
+            done();
+          });
+        });
+      });
+    })
+
+    it('allows users to blow it up', function(done){
+      var db = start();
+      var sch = new Schema({ title : String, subdoc : { name : String, num : Number }});
+
+      var M = db.model('updateover'+random(), sch);
+
+      M.create({ subdoc : { name : 'that', num : 1, title : 'hello' } }, function (err, doc) {
+        assert.ifError(err);
+
+        M.update({ _id : doc.id }, {}, { overwrite : true }, function (err) {
+          assert.ifError(err);
+          M.findById(doc.id, function (err, doc) {
+            assert.ifError(err);
+            assert.equal(doc.title, undefined);
+            assert.equal(doc.subdoc.name, undefined);
+            assert.equal(doc.subdoc.num, undefined);
+            done();
+          });
+        });
+      });
+    })
+  });
+
+  it('casts empty arrays', function(done) {
+    var db = start();
+
+    var so = new Schema({ arr: [] });
+    var Some = db.model('1838-' + random(), so);
+
+    Some.create({ arr: ['a'] }, function (err, s) {
+      if (err) return done(err);
+
+      Some.update({ _id: s._id }, { arr: [] }, function(err) {
+        if (err) return done(err);
+        Some.findById(s._id, function(err, doc) {
+          db.close();
+          if (err) return done(err);
+          assert.ok(Array.isArray(doc.arr));
+          assert.strictEqual(0, doc.arr.length);
+          done();
+        });
+      });
+    });
+  });
 });

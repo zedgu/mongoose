@@ -11,3 +11,7 @@ benchmarks/v8.log
 docs/*.json
 docs/source/_docs
 docs/*.html
+tags
+test/triage/*.js
+/.idea
+/inspections

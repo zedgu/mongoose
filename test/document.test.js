@@ -14,7 +14,8 @@ var start = require('./common')
   , SchemaType = mongoose.SchemaType
   , ValidatorError = SchemaType.ValidatorError
   , ValidationError = mongoose.Document.ValidationError
-  , MongooseError = mongoose.Error;
+  , MongooseError = mongoose.Error
+  , Query = require('../lib/query');
 
 /**
  * Test Document constructor.
@@ -92,11 +93,18 @@ TestDocument.prototype.hooksTest = function(fn){
   fn(null, arguments);
 };
 
+var childSchema = new Schema({ counter: Number });
+
+var parentSchema = new Schema({
+  name: String,
+  children: [childSchema]
+});
+
 /**
  * Test.
  */
 
-describe('document:', function(){
+describe('document', function(){
 
   describe('shortcut getters', function(){
     it('return undefined for properties with a null/undefined parent object (gh-1326)', function(done){
@@ -262,6 +270,7 @@ describe('document:', function(){
           , path  : 'my path'
         }
       , nested2: {}
+      , date: new Date
     });
 
     var clone = doc.toObject({ getters: true, virtuals: false });
@@ -273,6 +282,7 @@ describe('document:', function(){
     assert.equal('5my path', clone.nested.path);
     assert.equal(undefined, clone.nested.agePlus2);
     assert.equal(undefined, clone.em[0].works);
+    assert.ok(clone.date instanceof Date);
 
     clone = doc.toObject({ virtuals: true });
 
@@ -309,6 +319,8 @@ describe('document:', function(){
 
     // minimize
     clone = doc.toObject({ minimize: true });
+    assert.equal(undefined, clone.nested2);
+    clone = doc.toObject({ minimize: true, getters: true });
     assert.equal(undefined, clone.nested2);
     clone = doc.toObject({ minimize: false });
     assert.equal('Object', clone.nested2.constructor.name);
@@ -399,7 +411,51 @@ describe('document:', function(){
     // all done
     delete doc.schema.options.toObject;
     done();
-  })
+  });
+
+  it('doesnt clobber child schema options when called with no params (gh-2035)', function(done) {
+    var db = start();
+    var userSchema = new Schema({
+      firstName: String,
+      lastName: String,
+      password: String
+    });
+
+    userSchema.virtual('fullName').get(function () {
+      return this.firstName + ' ' + this.lastName;
+    });
+
+    userSchema.set('toObject', { virtuals: false });
+
+    var postSchema = new Schema({
+      owner: { type: Schema.Types.ObjectId, ref: 'gh-2035-user' },
+      content: String
+    });
+
+    postSchema.virtual('capContent').get(function () {
+      return this.content.toUpperCase();
+    });
+
+    postSchema.set('toObject', { virtuals: true });
+    var User = db.model('gh-2035-user', userSchema, 'gh-2035-user');
+    var Post = db.model('gh-2035-post', postSchema, 'gh-2035-post');
+
+    var user = new User({ firstName: 'Joe', lastName: 'Smith', password: 'password' });
+
+    user.save(function (err, savedUser) {
+      assert.ifError(err);
+      var post = new Post({ owner: savedUser._id, content: 'lorem ipsum' });
+      post.save(function (err, savedPost) {
+        assert.ifError(err);
+        Post.findById(savedPost._id).populate('owner').exec(function (err, newPost) {
+          assert.ifError(err);
+          var obj = newPost.toObject();
+          assert.equal(obj.owner.fullName, undefined);
+          db.close(done);
+        });
+      });
+    });
+  });
 
   it('toJSON options', function(done){
     var doc = new TestDocument();
@@ -540,13 +596,44 @@ describe('document:', function(){
     assert.equal(obj._id, oidString);
     done();
   });
+  it('jsonifying an object\'s populated items works (gh-1376)', function(done){
+    var db = start();
+    var userSchema, User, groupSchema, Group;
+
+    userSchema = Schema({name: String});
+    // includes virtual path when 'toJSON'
+    userSchema.set('toJSON', {getters: true});
+    userSchema.virtual('hello').get(function() {
+      return 'Hello, ' + this.name;
+    });
+    User = db.model('User', userSchema);
+
+    groupSchema = Schema({
+      name: String,
+      _users: [{type: Schema.ObjectId, ref: 'User'}]
+    });
+
+    Group = db.model('Group', groupSchema);
+
+    User.create({name: 'Alice'}, {name: 'Bob'}, function(err, alice, bob) {
+      assert.ifError(err);
+
+      new Group({name: 'mongoose', _users: [alice, bob]}).save(function(err, group) {
+        Group.findById(group).populate('_users').exec(function(err, group) {
+          assert.ifError(err);
+          assert.ok(group.toJSON()._users[0].hello);
+          done();
+        });
+      });
+    });
+  })
 
   describe('#update', function(){
     it('returns a Query', function(done){
       var mg = new mongoose.Mongoose;
       var M = mg.model('doc#update', { s: String });
       var doc = new M;
-      assert.ok(doc.update() instanceof mongoose.Query);
+      assert.ok(doc.update() instanceof Query);
       done();
     })
     it('calling update on document should relay to its model (gh-794)', function(done){
@@ -678,220 +765,6 @@ describe('document:', function(){
     done();
   });
 
-  it('isSelected()', function(done){
-    var doc = new TestDocument();
-
-    doc.init({
-        test    : 'test'
-      , numbers : [4,5,6,7]
-      , nested  : {
-            age   : 5
-          , cool  : DocumentObjectId.createFromHexString('4c6c2d6240ced95d0e00003c')
-          , path  : 'my path'
-          , deep  : { x: 'a string' }
-        }
-      , notapath: 'i am not in the schema'
-      , em: [{ title: 'gocars' }]
-    });
-
-    assert.ok(doc.isSelected('_id'));
-    assert.ok(doc.isSelected('test'));
-    assert.ok(doc.isSelected('numbers'));
-    assert.ok(doc.isSelected('oids')); // even if no data
-    assert.ok(doc.isSelected('nested'));
-    assert.ok(doc.isSelected('nested.age'));
-    assert.ok(doc.isSelected('nested.cool'));
-    assert.ok(doc.isSelected('nested.path'));
-    assert.ok(doc.isSelected('nested.deep'));
-    assert.ok(doc.isSelected('nested.nope')); // not a path
-    assert.ok(doc.isSelected('nested.deep.x'));
-    assert.ok(doc.isSelected('nested.deep.x.no'));
-    assert.ok(doc.isSelected('nested.deep.y')); // not a path
-    assert.ok(doc.isSelected('noway')); // not a path
-    assert.ok(doc.isSelected('notapath')); // not a path but in the _doc
-    assert.ok(doc.isSelected('em'));
-    assert.ok(doc.isSelected('em.title'));
-    assert.ok(doc.isSelected('em.body'));
-    assert.ok(doc.isSelected('em.nonpath')); // not a path
-
-    var selection = {
-        'test': 1
-      , 'numbers': 1
-      , 'nested.deep': 1
-      , 'oids': 1
-    }
-
-    doc = new TestDocument(undefined, selection);
-
-    doc.init({
-        test    : 'test'
-      , numbers : [4,5,6,7]
-      , nested  : {
-            deep  : { x: 'a string' }
-        }
-    });
-
-    assert.ok(doc.isSelected('_id'))
-    assert.ok(doc.isSelected('test'))
-    assert.ok(doc.isSelected('numbers'))
-    assert.ok(doc.isSelected('oids')); // even if no data
-    assert.ok(doc.isSelected('nested'));
-    assert.ok(!doc.isSelected('nested.age'))
-    assert.ok(!doc.isSelected('nested.cool'))
-    assert.ok(!doc.isSelected('nested.path'))
-    assert.ok(doc.isSelected('nested.deep'))
-    assert.ok(!doc.isSelected('nested.nope'))
-    assert.ok(doc.isSelected('nested.deep.x'));
-    assert.ok(doc.isSelected('nested.deep.x.no'))
-    assert.ok(doc.isSelected('nested.deep.y'))
-    assert.ok(!doc.isSelected('noway'))
-    assert.ok(!doc.isSelected('notapath'))
-    assert.ok(!doc.isSelected('em'))
-    assert.ok(!doc.isSelected('em.title'))
-    assert.ok(!doc.isSelected('em.body'))
-    assert.ok(!doc.isSelected('em.nonpath'))
-
-    var selection = {
-        'em.title': 1
-    }
-
-    doc = new TestDocument(undefined, selection);
-
-    doc.init({
-        em: [{ title: 'one' }]
-    });
-
-    assert.ok(doc.isSelected('_id'))
-    assert.ok(!doc.isSelected('test'))
-    assert.ok(!doc.isSelected('numbers'))
-    assert.ok(!doc.isSelected('oids'))
-    assert.ok(!doc.isSelected('nested'))
-    assert.ok(!doc.isSelected('nested.age'))
-    assert.ok(!doc.isSelected('nested.cool'))
-    assert.ok(!doc.isSelected('nested.path'))
-    assert.ok(!doc.isSelected('nested.deep'))
-    assert.ok(!doc.isSelected('nested.nope'))
-    assert.ok(!doc.isSelected('nested.deep.x'))
-    assert.ok(!doc.isSelected('nested.deep.x.no'))
-    assert.ok(!doc.isSelected('nested.deep.y'))
-    assert.ok(!doc.isSelected('noway'))
-    assert.ok(!doc.isSelected('notapath'))
-    assert.ok(doc.isSelected('em'))
-    assert.ok(doc.isSelected('em.title'))
-    assert.ok(!doc.isSelected('em.body'))
-    assert.ok(!doc.isSelected('em.nonpath'))
-
-    var selection = {
-        'em': 0
-    }
-
-    doc = new TestDocument(undefined, selection);
-    doc.init({
-        test    : 'test'
-      , numbers : [4,5,6,7]
-      , nested  : {
-            age   : 5
-          , cool  : DocumentObjectId.createFromHexString('4c6c2d6240ced95d0e00003c')
-          , path  : 'my path'
-          , deep  : { x: 'a string' }
-        }
-      , notapath: 'i am not in the schema'
-    });
-
-    assert.ok(doc.isSelected('_id'))
-    assert.ok(doc.isSelected('test'))
-    assert.ok(doc.isSelected('numbers'))
-    assert.ok(doc.isSelected('oids'))
-    assert.ok(doc.isSelected('nested'))
-    assert.ok(doc.isSelected('nested.age'))
-    assert.ok(doc.isSelected('nested.cool'))
-    assert.ok(doc.isSelected('nested.path'))
-    assert.ok(doc.isSelected('nested.deep'))
-    assert.ok(doc.isSelected('nested.nope'))
-    assert.ok(doc.isSelected('nested.deep.x'))
-    assert.ok(doc.isSelected('nested.deep.x.no'))
-    assert.ok(doc.isSelected('nested.deep.y'))
-    assert.ok(doc.isSelected('noway'))
-    assert.ok(doc.isSelected('notapath'));
-    assert.ok(!doc.isSelected('em'));
-    assert.ok(!doc.isSelected('em.title'));
-    assert.ok(!doc.isSelected('em.body'));
-    assert.ok(!doc.isSelected('em.nonpath'));
-
-    var selection = {
-        '_id': 0
-    }
-
-    doc = new TestDocument(undefined, selection);
-    doc.init({
-        test    : 'test'
-      , numbers : [4,5,6,7]
-      , nested  : {
-            age   : 5
-          , cool  : DocumentObjectId.createFromHexString('4c6c2d6240ced95d0e00003c')
-          , path  : 'my path'
-          , deep  : { x: 'a string' }
-        }
-      , notapath: 'i am not in the schema'
-    });
-
-    assert.ok(!doc.isSelected('_id'))
-    assert.ok(doc.isSelected('nested.deep.x.no'));
-
-    doc = new TestDocument({ test: 'boom' });
-    assert.ok(doc.isSelected('_id'))
-    assert.ok(doc.isSelected('test'))
-    assert.ok(doc.isSelected('numbers'))
-    assert.ok(doc.isSelected('oids'))
-    assert.ok(doc.isSelected('nested'))
-    assert.ok(doc.isSelected('nested.age'))
-    assert.ok(doc.isSelected('nested.cool'))
-    assert.ok(doc.isSelected('nested.path'))
-    assert.ok(doc.isSelected('nested.deep'))
-    assert.ok(doc.isSelected('nested.nope'))
-    assert.ok(doc.isSelected('nested.deep.x'))
-    assert.ok(doc.isSelected('nested.deep.x.no'))
-    assert.ok(doc.isSelected('nested.deep.y'))
-    assert.ok(doc.isSelected('noway'))
-    assert.ok(doc.isSelected('notapath'))
-    assert.ok(doc.isSelected('em'))
-    assert.ok(doc.isSelected('em.title'))
-    assert.ok(doc.isSelected('em.body'))
-    assert.ok(doc.isSelected('em.nonpath'));
-
-    var selection = {
-        '_id': 1
-    }
-
-    doc = new TestDocument(undefined, selection);
-    doc.init({ _id: 'test' });
-
-    assert.ok(doc.isSelected('_id'));
-    assert.ok(!doc.isSelected('test'));
-
-    doc = new TestDocument({ test: 'boom' }, true);
-    assert.ok(doc.isSelected('_id'));
-    assert.ok(doc.isSelected('test'));
-    assert.ok(doc.isSelected('numbers'));
-    assert.ok(doc.isSelected('oids'));
-    assert.ok(doc.isSelected('nested'));
-    assert.ok(doc.isSelected('nested.age'));
-    assert.ok(doc.isSelected('nested.cool'));
-    assert.ok(doc.isSelected('nested.path'));
-    assert.ok(doc.isSelected('nested.deep'));
-    assert.ok(doc.isSelected('nested.nope'));
-    assert.ok(doc.isSelected('nested.deep.x'));
-    assert.ok(doc.isSelected('nested.deep.x.no'));
-    assert.ok(doc.isSelected('nested.deep.y'));
-    assert.ok(doc.isSelected('noway'));
-    assert.ok(doc.isSelected('notapath'));
-    assert.ok(doc.isSelected('em'));
-    assert.ok(doc.isSelected('em.title'));
-    assert.ok(doc.isSelected('em.body'));
-    assert.ok(doc.isSelected('em.nonpath'));
-    done();
-  })
-
   it('unselected required fields should pass validation', function(done){
     var db = start()
       , Tschema = new Schema({ name: String, req: { type: String, required: true }})
@@ -912,7 +785,7 @@ describe('document:', function(){
             t.req = undefined;
             t.save(function (err) {
               err = String(err);
-              var invalid  = /Validator "required" failed for path req/.test(err);
+              var invalid  = /Path `req` is required./.test(err);
               assert.ok(invalid);
               t.req = 'it works again'
               t.save(function (err) {
@@ -968,6 +841,64 @@ describe('document:', function(){
       })
     })
 
+    it('can return a promise', function(done) {
+      var db = start()
+        , schema = null
+        , called = false
+
+      var validate = [function(str){ called = true; return true }, 'BAM'];
+
+      schema = new Schema({
+          prop: { type: String, required: true, validate: validate }
+        , nick: { type: String, required: true }
+      });
+
+      var M = db.model('validateSchemaPromise', schema, collection);
+      var m = new M({ prop: 'gh891', nick: 'validation test' });
+      var mBad = new M({ prop: 'other' });
+
+      var promise = m.validate();
+      promise.then(function(err) {
+        var promise2 = mBad.validate();
+        promise2.onReject(function(err) {
+          assert.ok(!!err);
+          clearTimeout(timeout);
+          db.close();
+          done();
+        });
+      });
+
+      var timeout = setTimeout(function() {
+        db.close();
+        throw new Error("Promise not fulfilled!");
+      }, 500);
+    });
+
+    it('returns a promise when there are no validators', function(done) {
+      var db = start()
+        , schema = null
+        , called = false
+
+      schema = new Schema({ _id : String });
+
+      var M = db.model('validateSchemaPromise2', schema, collection);
+      var m = new M();
+
+      var promise = m.validate();
+      promise.then(function() {
+        clearTimeout(timeout);
+        db.close();
+        done();
+      });
+
+      var timeout = setTimeout(function() {
+        if (!fulfilled) {
+          db.close();
+          throw new Error("Promise not fulfilled!");
+        }
+      }, 500);
+    });
+
     describe('works on arrays', function(){
       var db;
       before(function(done){
@@ -986,10 +917,10 @@ describe('document:', function(){
         var M = db.model('validateSchema-array1', schema, collection);
         var m = new M({ name: 'gh1109-1' });
         m.save(function (err) {
-          assert.ok(/"required" failed for path arr/.test(err));
+          assert.ok(/Path `arr` is required/.test(err));
           m.arr = [];
           m.save(function (err) {
-            assert.ok(/"required" failed for path arr/.test(err));
+            assert.ok(/Path `arr` is required/.test(err));
             m.arr.push('works');
             m.save(function (err) {
               assert.ifError(err);
@@ -1017,7 +948,7 @@ describe('document:', function(){
         var m = new M({ name: 'gh1109-2', arr: [1] });
         assert.equal(false, called);
         m.save(function (err) {
-          assert.ok(/"BAM" failed for path arr/.test(err));
+          assert.equal('ValidationError: BAM', String(err));
           assert.equal(true, called);
           m.arr.push(2);
           called = false;
@@ -1046,10 +977,10 @@ describe('document:', function(){
         var M = db.model('validateSchema-array3', schema, collection);
         var m = new M({ name: 'gh1109-3' });
         m.save(function (err) {
-          assert.ok(/"required" failed for path arr/.test(err));
+          assert.equal(err.errors.arr.message, 'Path `arr` is required.');
           m.arr.push({nice: true});
           m.save(function (err) {
-            assert.ok(/"BAM" failed for path arr/.test(err));
+            assert.equal(String(err), 'ValidationError: BAM');
             m.arr.push(95);
             m.save(function (err) {
               assert.ifError(err);
@@ -1060,7 +991,119 @@ describe('document:', function(){
       })
 
     })
-  })
+
+    it("validator should run only once gh-1743", function (done) {
+      var count = 0
+        , db = start()
+
+      var Control = new Schema({
+        test: {
+          type: String
+          , validate: function ( value, done ) {
+            count++;
+            return done( true );
+          }
+        }
+      });
+      var PostSchema = new Schema({
+        controls: [Control]
+      });
+
+      var Post = db.model('post', PostSchema);
+
+      var post = new Post({
+        controls: [{
+          test: "xx"
+        }]
+      });
+
+      post.save(function () {
+        assert.equal(count, 1);
+        done();
+      });
+    })
+
+    it("validator should run only once per sub-doc gh-1743", function (done) {
+      var count = 0
+        , db = start()
+
+      var Control = new Schema({
+        test: {
+          type: String
+          , validate: function ( value, done ) {
+            count++;
+            return done( true );
+          }
+        }
+      });
+      var PostSchema = new Schema({
+        controls: [Control]
+      });
+
+      var Post = db.model('post', PostSchema);
+
+      var post = new Post({
+        controls: [
+          {
+            test: "xx"
+          }
+          ,
+          {
+            test: "yy"
+          }
+        ]
+      });
+
+      post.save(function () {
+        assert.equal(count, post.controls.length);
+        done();
+      });
+    });
+
+
+    it("validator should run in parallel", function (done) {
+      // we set the time out to be double that of the validator - 1 (so that running in serial will be greater then that)
+      this.timeout(1000);
+      var db = start(),
+        count = 0;
+
+      var SchemaWithValidator = new Schema ({
+        preference: {
+          type: String
+          , required: true
+          , validate: function validator (value, done) {count++; setTimeout(done.bind(null, true), 500);}
+        }
+      });
+
+      var MWSV = db.model('mwv', new Schema({subs: [SchemaWithValidator]}));
+      var m = new MWSV({
+        subs: [
+          {
+            preference: "xx"
+          }
+          ,
+          {
+            preference: "yy"
+          }
+          ,
+          {
+            preference: "1"
+          }
+          ,
+          {
+            preference: "2"
+          }
+        ]
+      });
+
+      m.save(function (err) {
+        assert.ifError(err);
+        assert.equal(count, 4);
+        done();
+      });
+    })
+
+  });
 
   it('#invalidate', function(done){
     var db = start()
@@ -1077,14 +1120,14 @@ describe('document:', function(){
     Post = db.model('InvalidateSchema');
     post = new Post();
     post.set({baz: 'val'});
-    post.invalidate('baz', 'reason');
+    post.invalidate('baz', 'validation failed for path {PATH}');
 
     post.save(function(err){
       assert.ok(err instanceof MongooseError);
       assert.ok(err instanceof ValidationError);
       assert.ok(err.errors.baz instanceof ValidatorError);
-      assert.equal(err.errors.baz.message,'Validator "reason" failed for path baz');
-      assert.equal(err.errors.baz.type,'reason');
+      assert.equal(err.errors.baz.message,'validation failed for path baz');
+      assert.equal(err.errors.baz.kind,'user defined');
       assert.equal(err.errors.baz.path,'baz');
 
       post.save(function(err){
@@ -1102,6 +1145,7 @@ describe('document:', function(){
       var N = db.model('equals-N', new Schema({ _id: Number }));
       var O = db.model('equals-O', new Schema({ _id: Schema.ObjectId }));
       var B = db.model('equals-B', new Schema({ _id: Buffer }));
+      var M = db.model('equals-I', new Schema({ name: String }, { _id: false }));
 
       it('with string _ids', function(done){
         var s1 = new S({ _id: 'one' });
@@ -1131,6 +1175,14 @@ describe('document:', function(){
         var n1 = new B({ _id: 0 });
         var n2 = new B({ _id: 0 });
         assert.ok(n1.equals(n2));
+        done();
+      })
+      it('with _id disabled (gh-1687)', function(done){
+        var m1 = new M;
+        var m2 = new M;
+        assert.doesNotThrow(function () {
+          m1.equals(m2)
+        });
         done();
       })
 
@@ -1238,8 +1290,33 @@ describe('document:', function(){
           assert.ok(!doc.isModified('nested.age'));
           assert.ok(doc.isModified('nested.deep'));
           assert.equal('Hank and Marie', doc.nested.deep.x);
+          
           done();
         })
+
+        it('gh-1954', function(done){
+          var schema = new Schema({
+            schedule: [ new Schema({open: Number, close: Number}) ]
+          });
+
+          var M = mongoose.model('Blog', schema);
+
+          var doc = new M({
+            schedule: [{
+              open: 1000,
+              close: 1900
+            }]
+          });
+
+          doc.set('schedule.0.open', 1100);
+          assert.ok(doc.schedule);
+          assert.equal('MongooseDocumentArray', doc.schedule.constructor.name);
+          assert.equal('EmbeddedDocument', doc.schedule[0].constructor.name);
+          assert.equal(1100, doc.schedule[0].open);
+          assert.equal(1900, doc.schedule[0].close);
+
+          done();
+        });
       })
 
       describe('when overwriting with a document instance', function(){
@@ -1294,5 +1371,34 @@ describe('document:', function(){
         done();
       })
     })
-  })
+  });
+
+  describe('gh-2082', function() {
+    it('works', function(done) {
+      var db = start();
+      var Parent = db.model('gh2082', parentSchema, 'gh2082');
+
+      var parent = new Parent({name: 'Hello'});
+      parent.save(function(err, parent) {
+        assert.ifError(err);
+        parent.children.push( {counter: 0} );
+        parent.save(function(err, parent) {
+          assert.ifError(err);
+          parent.children[0].counter += 1;
+          parent.save(function(err, parent) {
+            assert.ifError(err);
+            parent.children[0].counter += 1;
+            parent.save(function(err, parent) {
+              assert.ifError(err);
+              Parent.findOne({}, function(error, parent) {
+                assert.ifError(error);
+                assert.equal(2, parent.children[0].counter);
+                done();
+              });
+            });
+          });
+        });
+      });
+    });
+  });
 })

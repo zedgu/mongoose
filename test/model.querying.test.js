@@ -7,12 +7,12 @@ var start = require('./common')
   , assert = require('assert')
   , mongoose = start.mongoose
   , random = require('../lib/utils').random
-  , Query = require('../lib/query')
   , Schema = mongoose.Schema
   , SchemaType = mongoose.SchemaType
   , ObjectId = Schema.Types.ObjectId
   , MongooseBuffer = mongoose.Types.Buffer
-  , DocumentObjectId = mongoose.Types.ObjectId;
+  , DocumentObjectId = mongoose.Types.ObjectId
+  , Query = require('../lib/query');
 
 /**
  * Setup.
@@ -58,6 +58,16 @@ mongoose.model('Mod', ModSchema);
 var geoSchema = new Schema({ loc: { type: [Number], index: '2d'}});
 
 describe('model: querying:', function(){
+  var mongo26_or_greater = false;
+  before(function(done){
+    start.mongodVersion(function (err, version) {
+      if (err) throw err;
+      mongo26_or_greater = 2 < version[0] || (2 == version[0] && 6 <= version[1]);
+      if (!mongo26_or_greater) console.log('not testing mongodb 2.6 features');
+      done();
+    })
+  })
+
   it('find returns a Query', function(done){
     var db = start()
       , BlogPostB = db.model('BlogPostB', collection);
@@ -245,14 +255,32 @@ describe('model: querying:', function(){
       Address.create({ zip: '10010'}, { zip: '10010'}, { zip: '99701'}, function (err, a1, a2, a3) {
         assert.strictEqual(null, err);
         var query = Address.distinct('zip', {}, function (err, results) {
-          assert.ifError(err);
-          assert.deepEqual(results, ['10010', '99701']);
           db.close();
+          assert.ifError(err);
+          assert.equal(2, results.length);
+          assert.ok(results.indexOf('10010') > -1);
+          assert.ok(results.indexOf('99701') > -1);
           done();
         });
         assert.ok(query instanceof Query);
       });
     });
+
+    it('permits excluding conditions gh-1541', function(done){
+      var db = start();
+      var Address = new Schema({ zip: String });
+      Address = db.model('Address', Address, 'addresses_' + random());
+      Address.create({ zip: '10010'}, { zip: '10010'}, { zip: '99701'}, function (err, a1, a2, a3) {
+        assert.ifError(err);
+        var query = Address.distinct('zip', function (err, results) {
+          assert.ifError(err);
+          assert.equal(2, results.length);
+          assert.ok(results.indexOf('10010') > -1);
+          assert.ok(results.indexOf('99701') > -1);
+          db.close(done);
+        });
+      });
+    })
   });
 
   describe('update', function(){
@@ -1047,8 +1075,17 @@ describe('model: querying:', function(){
             cb();
             assert.ifError(err);
             assert.equal(2, found.length);
-            assert.equal(found[0]._id.toString(), one._id);
-            assert.equal(found[1]._id.toString(), two._id);
+
+            var found1 = false;
+            var found2 = false;
+
+            found.forEach(function (doc) {
+              if (doc.id == one.id) found1 = true;
+              else if (doc.id == two.id) found2 = true;
+            })
+
+            assert.ok(found1);
+            assert.ok(found2);
           });
         }
 
@@ -1066,8 +1103,17 @@ describe('model: querying:', function(){
             cb();
             assert.ifError(err);
             assert.equal(2, found.length);
-            assert.equal(found[0]._id.toString(), one._id);
-            assert.equal(found[1]._id.toString(), two._id);
+
+            var found1 = false;
+            var found2 = false;
+
+            found.forEach(function (doc) {
+              if (doc.id == one.id) found1 = true;
+              else if (doc.id == two.id) found2 = true;
+            })
+
+            assert.ok(found1);
+            assert.ok(found2);
           });
         }
 
@@ -1393,7 +1439,44 @@ describe('model: querying:', function(){
         });
       }
 
-    })
+    });
+
+    it('works with text search', function(done) {
+      if (!mongo26_or_greater) {
+        return done();
+      }
+
+      var db = start()
+        , blogPost = db.model('BlogPostB', collection);
+
+      blogPost.collection.ensureIndex({ title : 'text' }, function(error, res) {
+        assert.ifError(error);
+        var a = new blogPost({ title : 'querying in mongoose' });
+        var b = new blogPost({ title : 'text search in mongoose' });
+        a.save(function(error) {
+          assert.ifError(error);
+          b.save(function(error) {
+            assert.ifError(error);
+            blogPost.
+              find({ $text : { $search : 'text search' } }, { score : { $meta: "textScore" } }).
+              limit(2).
+              exec(function(error, documents) {
+                assert.ifError(error);
+                assert.equal(1, documents.length);
+                assert.equal('text search in mongoose', documents[0].title);
+                a.remove(function(error) {
+                  assert.ifError(error);
+                  b.remove(function(error) {
+                    assert.ifError(error);
+                    db.close();
+                    done();
+                  });
+                });
+              });
+          });
+        });
+      });
+    });
   });
 
   describe('limit', function(){
@@ -1472,7 +1555,39 @@ describe('model: querying:', function(){
           });
         });
       });
-    })
+    });
+    it('handles sorting by text score', function(done) {
+      if (!mongo26_or_greater) {
+        return done();
+      }
+
+      var db = start()
+        , blogPost = db.model('BlogPostB', collection);
+
+      blogPost.collection.ensureIndex({ title : 'text' }, function(error, res) {
+        assert.ifError(error);
+        var a = new blogPost({ title : 'searching in mongoose' });
+        var b = new blogPost({ title : 'text search in mongoose' });
+        a.save(function(error) {
+          assert.ifError(error);
+          b.save(function(error) {
+            assert.ifError(error);
+            blogPost.
+              find({ $text : { $search : 'text search' } }, { score : { $meta: "textScore" } }).
+              sort({ score : { $meta : 'textScore' } }).
+              limit(2).
+              exec(function(error, documents) {
+                assert.ifError(error);
+                assert.equal(2, documents.length);
+                assert.equal('text search in mongoose', documents[0].title);
+                assert.equal('searching in mongoose', documents[1].title);
+                db.close();
+                done();
+              });
+          });
+        });
+      });
+    });
   });
 
   describe('nested mixed "x.y.z"', function(){
@@ -1792,7 +1907,11 @@ describe('buffers', function(){
         cb();
         assert.ifError(err);
         assert.equal(2, tests.length);
-        assert.equal(tests[0].block.toString('utf8'),'über');
+        var ret = {};
+        ret[tests[0].block.toString('utf8')] = 1;
+        ret[tests[1].block.toString('utf8')] = 1;
+
+        assert.ok(ret['über'] !== undefined);
       });
 
       Test.find({ block: { $lte: 'buffer shtuffs are neat' }}, function (err, tests) {
@@ -1927,6 +2046,48 @@ describe('geo-spatial', function(){
       }
     });
 
+    it('$nearSphere with invalid coordinate does not crash (gh-1874)', function(done) {
+      var geoSchema = new Schema({
+        loc: {
+          type: { type: String },
+          coordinates: { type: [Number], index: '2dsphere' }
+        }
+      });
+      var db = start()
+        , Test = db.model('gh1874', geoSchema, 'gh1874');
+
+      var pending = 2;
+      var complete = function(err) {
+        if (complete.ran) return;
+        if (err) return done(complete.ran = err);
+        --pending || test();
+      }
+
+      Test.on('index', complete);
+      Test.create(
+        { loc: { coordinates: [ 30, 41 ] } },
+        { loc: { coordinates: [ 31, 40 ] } },
+        complete);
+
+      var test = function() {
+        var q = new Query({}, {}, null, Test.collection);
+        q.find({
+          'loc': {
+            $nearSphere: {
+              $geometry: { type: 'Point', coordinates: [30, 40] },
+              $maxDistance: 10000000
+            }
+          }
+        });
+
+        assert.doesNotThrow(function () {
+          q.cast(Test);
+        });
+
+        done();
+      }
+    });
+
     it('$maxDistance with arrays', function(done){
       var db = start()
         , Test = db.model('Geo4', geoSchema, "x"+random());
@@ -1963,6 +2124,10 @@ describe('geo-spatial', function(){
 
     var geoSchema = new Schema({ line: { type: { type: String }, coordinates: []}});
     geoSchema.index({ line: '2dsphere' });
+
+    var geoMultiSchema = new Schema({ geom: [{ type: { type: String }, coordinates: []}]});
+    // see mongodb issue SERVER-8907
+    // geoMultiSchema.index({ geom: '2dsphere' });
 
     var mongo24_or_greater = false;
     before(function(done){
@@ -2005,7 +2170,7 @@ describe('geo-spatial', function(){
               assert.equal(1, docs.length);
               assert.equal(created.id, docs[0].id);
 
-              Test.where('loc').within.geometry(geojsonPoly).exec(function (err, docs) {
+              Test.where('loc').within().geometry(geojsonPoly).exec(function (err, docs) {
                 assert.ifError(err);
                 assert.equal(1, docs.length);
                 assert.equal(created.id, docs[0].id);
@@ -2037,7 +2202,7 @@ describe('geo-spatial', function(){
               assert.equal(1, docs.length);
               assert.equal(created.id, docs[0].id);
 
-              Test.where('line').intersects.geometry(geojsonLine).findOne(function (err, doc) {
+              Test.where('line').intersects().geometry(geojsonLine).findOne(function (err, doc) {
                 assert.ifError(err);
                 assert.equal(created.id, doc.id);
                 done();
@@ -2045,6 +2210,58 @@ describe('geo-spatial', function(){
             })
           })
 
+        })
+      });
+
+      it('MultiLineString', function(done){
+        if (!mongo24_or_greater) return done();
+
+        var db = start()
+          , Test = db.model('2dsphere-geo-multi1', geoMultiSchema, 'geospatial'+random());
+
+        Test.create({ geom: [{ type:'LineString', coordinates: [[-178.0, 10.0],[178.0,10.0]] },
+                             { type:'LineString', coordinates: [[-178.0, 5.0],[178.0,5.0]] } ]}, function (err, created) {
+          assert.ifError(err);
+
+          var geojsonLine = { type: 'LineString', coordinates: [[180.0, 11.0], [180.0, '9.00']] }
+
+          Test.find({ geom: { $geoIntersects: { $geometry: geojsonLine }}}, function (err, docs) {
+            assert.ifError(err);
+            assert.equal(1, docs.length);
+            assert.equal(created.id, docs[0].id);
+
+            Test.where('geom').intersects().geometry(geojsonLine).findOne(function (err, doc) {
+              assert.ifError(err);
+              assert.equal(created.id, doc.id);
+              done();
+            })
+          })
+        })
+      });
+
+      it('MultiPolygon', function(done){
+        if (!mongo24_or_greater) return done();
+
+        var db = start()
+          , Test = db.model('2dsphere-geo-multi2', geoMultiSchema, 'geospatial'+random());
+
+        Test.create({ geom: [{ type: "Polygon", coordinates: [[ [28.7,41],[29.2,40.9],[29.1,41.3],[28.7,41] ]] },
+                             { type: "Polygon", coordinates: [[ [-1,-1],[1,-1],[1,1],[-1,1],[-1,-1] ]] }]}, function (err, created) {
+          assert.ifError(err);
+
+          var geojsonPolygon = { type: 'Polygon', coordinates: [[ [26,36],[45,36],[45,42],[26,42],[26,36] ]] }
+
+          Test.find({ geom: { $geoIntersects: { $geometry: geojsonPolygon }}}, function (err, docs) {
+            assert.ifError(err);
+            assert.equal(1, docs.length);
+            assert.equal(created.id, docs[0].id);
+
+            Test.where('geom').intersects().geometry(geojsonPolygon).findOne(function (err, doc) {
+              assert.ifError(err);
+              assert.equal(created.id, doc.id);
+              done();
+            })
+          })
         })
       });
     })
@@ -2069,7 +2286,7 @@ describe('geo-spatial', function(){
               assert.equal(1, docs.length);
               assert.equal(created.id, docs[0].id);
 
-              Test.find({ line: { $near: { $geometry: geojsonPoint }, $maxDistance: '50'}}, function (err, docs) {
+              Test.find({ line: { $near: { $geometry: geojsonPoint, $maxDistance: 50 } } }, function (err, docs) {
                 assert.ifError(err);
                 assert.equal(1, docs.length);
                 assert.equal(created.id, docs[0].id);
@@ -2079,6 +2296,40 @@ describe('geo-spatial', function(){
           })
         })
       });
+
+      it('works with GeoJSON (gh-1482)', function (done) {
+        if (!mongo24_or_greater) return done();
+
+        var geoJSONSchema = new Schema({ loc : { type : { type : String }, coordinates : [Number] } });
+        geoJSONSchema.index({ loc : '2dsphere' });
+        var name = 'geospatial'+random();
+        var db = start()
+          , Test = db.model('Geo1', geoJSONSchema, name);
+
+        var pending = 2;
+        function complete (err) {
+          if (complete.ran) return;
+          if (err) return done(complete.ran = err);
+          --pending || test();
+        }
+
+        Test.on('index', complete);
+        Test.create({ loc: { type : 'Point', coordinates :[ 10, 20 ]}}, { loc: {
+          type : 'Point', coordinates: [ 40, 90 ]}}, complete);
+
+        function test () {
+          // $maxDistance is in meters... so even though they aren't that far off
+          // in lat/long, need an incredibly high number here
+          Test.where('loc').near({ center : { type : 'Point', coordinates :
+            [11,20]}, maxDistance : 1000000 }).exec(function (err, docs) {
+            db.close();
+            assert.ifError(err);
+            assert.equal(1, docs.length);
+            done();
+          });
+        }
+      });
+
     })
   })
 
@@ -2178,5 +2429,53 @@ describe('lean option:', function(){
       });
     });
   });
+  it('properly casts nested and/or queries (gh-676)', function(done){
+    var sch = new Schema({
+      num : Number,
+      subdoc : { title : String, num : Number }
+    });
 
+    var M = mongoose.model('andor' + random(), sch);
+
+    var cond = {
+      $and : [
+        { $or : [ { num : '23' }, { 'subdoc.num' : '45' } ] },
+        { $and : [ { 'subdoc.title' : 233 }, { num : '345' } ] }
+      ]
+    };
+    var q = M.find(cond);
+    assert.equal('number', typeof q._conditions.$and[0].$or[0].num);
+    assert.equal('number', typeof q._conditions.$and[0].$or[1]['subdoc.num']);
+    assert.equal('string', typeof q._conditions.$and[1].$and[0]['subdoc.title']);
+    assert.equal('number', typeof q._conditions.$and[1].$and[1].num);
+    done();
+  })
+  it('properly casts deeply nested and/or queries (gh-676)', function(done){
+    var sch = new Schema({
+      num : Number,
+      subdoc : { title : String, num : Number }
+    });
+
+    var M = mongoose.model('andor' + random(), sch);
+
+    var cond = {
+      $and : [
+        { $or : [
+            { $and : [
+                { $or : [
+                    { num : '12345' },
+                    { 'subdoc.num' : '56789' }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    };
+    var q = M.find(cond);
+    assert.equal('number', typeof q._conditions.$and[0].$or[0].$and[0].$or[0].num);
+    assert.equal('number', typeof q._conditions.$and[0].$or[0].$and[0].$or[1]['subdoc.num']);
+    done();
+  })
 })

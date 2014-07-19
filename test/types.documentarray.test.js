@@ -220,6 +220,45 @@ describe('types.documentarray', function(){
       assert.equal(undefined, delta.$pushAll.docs[0].changed);
       done();
     })
+    it('uses the correct transform (gh-1412)', function(done){
+      var db = start();
+      var FirstSchema = new Schema({
+        second: [SecondSchema],
+      });
+
+      FirstSchema.set('toObject', {
+      transform: function first(doc, ret, options) {
+          ret.firstToObject = true;
+          return ret;
+        },
+      });
+
+      var SecondSchema = new Schema({});
+
+      SecondSchema.set('toObject', {
+        transform: function second(doc, ret, options) {
+          ret.secondToObject = true;
+          return ret;
+        },
+      });
+
+      var First = db.model('first', FirstSchema);
+      var Second = db.model('second', SecondSchema);
+
+      var first = new First({
+      });
+
+      first.second.push(new Second());
+      first.second.push(new Second());
+      var obj = first.toObject();
+
+      assert.ok(obj.firstToObject);
+      assert.ok(obj.second[0].secondToObject);
+      assert.ok(obj.second[1].secondToObject);
+      assert.ok(!obj.second[0].firstToObject);
+      assert.ok(!obj.second[1].firstToObject);
+      done();
+    })
   })
 
   describe('create()', function(){
@@ -359,7 +398,8 @@ describe('types.documentarray', function(){
         var e = t.errors['docs.0.name'];
         assert.ok(e);
         assert.equal(e.path, 'docs.0.name');
-        assert.equal(e.type, 'boo boo');
+        assert.equal(e.kind, 'user defined');
+        assert.equal(e.message, 'boo boo');
         assert.equal(e.value, '%');
         done();
       })
@@ -379,5 +419,26 @@ describe('types.documentarray', function(){
         done();
       });
     })
+
+    it('removes attached event listeners when creating new doc array', function(done) {
+      var db = start();
+      var nested = Schema({ v: { type: Number }});
+      var schema = Schema({
+          docs: [nested]
+      }, { collection: 'gh-2159' });
+      var M = db.model('gh-2159', schema);
+      M.create({ docs: [{v: 900}] }, function(error, m) {
+        m.shouldPrint = true;
+        assert.ifError(error);
+        var numListeners = m._events.save.length;
+        assert.ok(numListeners > 0);
+        m.docs = [{ v: 9000 }];
+        m.save(function(error, m) {
+          assert.ifError(error);
+          assert.equal(numListeners, m._events.save.length);
+          done();
+        });
+      });
+    });
   })
 })
